@@ -1,0 +1,4 @@
+{
+  "alice": ["alice@acme.com", "alice.smith@gmail.com", "Alice Smith"],
+  "bob": ["bob@widgets.dev", "Bob from Widgets Inc"]
+}

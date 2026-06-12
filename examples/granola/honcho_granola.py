@@ -24,11 +24,32 @@ limits, interrupted runs):
     imports get upgraded when a transcript becomes available
   - 'a' at any review prompt = accept defaults for everything remaining
 
+Your own words always reach your peer: "Me" turns are microphone-grounded, so
+they're imported and reasoned over in every mode — two-person, multi-person —
+except when a meeting looks like an in-person/room-mic recording (multiple
+attendees but zero "Them" turns), where "Me" may contain other voices; those
+are flagged for review instead of auto-ingested.
+
+External participants are up to you (GRANOLA_EXTERNALS):
+    full  - externals become peers; their words/presence build representations (default)
+    store - externals become peers and their messages are stored/searchable, but
+            Honcho does not derive representations of them (peer observe_me=false)
+    none  - no peers are created for externals; only your side and meeting
+            summaries are imported (other people exist as names in text)
+
+Identity resolution: drop an aliases.json next to this script to map the
+identifiers Granola sees onto canonical peer IDs, so the same person resolves
+to ONE peer across meetings and across other integrations (e.g. Gmail):
+    { "dan": ["daniel@variant.fund", "dan.b@gmail.com", "Daniel Barabander"] }
+Each imported peer is also stamped with the emails/names/sources seen for it
+in peer metadata, so other importers can resolve against the same registry.
+
 Environment Variables:
     HONCHO_API_KEY    - Your Honcho API key (get from app.honcho.dev/api-keys)
     GRANOLA_WORKSPACE - Honcho workspace to import into (default: granola)
     GRANOLA_ME_PEER   - Optional peer ID for the note creator (default: derived
                         from your email, e.g. alice@example.com -> alice-example-com)
+    GRANOLA_EXTERNALS - full | store | none (default: full), see above
     GRANOLA_EARLIEST  - Start of history window, YYYY-MM-DD (default: 2024-01-01)
 
 Usage:
@@ -90,6 +111,7 @@ OAUTH_REDIRECT_URI = f"http://localhost:{OAUTH_REDIRECT_PORT}/callback"
 # into a primary memory workspace by accident.
 HONCHO_WORKSPACE = os.environ.get("GRANOLA_WORKSPACE", "granola")
 ME_PEER_OVERRIDE = os.environ.get("GRANOLA_ME_PEER")  # map the note creator to an existing peer ID
+EXTERNALS_TIER = os.environ.get("GRANOLA_EXTERNALS", "full")  # full | store | none
 HONCHO_BASE_URL = os.environ.get("HONCHO_BASE_URL", "https://api.honcho.dev")
 MAX_MESSAGE_LEN = 24000  # Honcho message size limit (25000 max, leave headroom)
 
@@ -925,6 +947,64 @@ def peer_id_from(value: str) -> str:
     return (norm or "peer")[:100]
 
 
+# Identity registry: aliases.json maps canonical peer IDs to the identifiers
+# (emails, names) a source may report for that person, so the same human
+# resolves to one peer across meetings and across integrations.
+ALIASES_FILE = Path(__file__).resolve().parent / "aliases.json"
+
+
+def load_aliases() -> dict[str, str]:
+    raw = load_json(ALIASES_FILE, {})
+    lookup: dict[str, str] = {}
+    for canonical, identifiers in raw.items():
+        for ident in identifiers:
+            lookup[str(ident).strip().lower()] = canonical
+    return lookup
+
+
+ALIASES = load_aliases()
+
+
+def resolve_peer_id(p: Participant) -> str:
+    for ident in (p.email, p.name):
+        if ident and ident.strip().lower() in ALIASES:
+            return ALIASES[ident.strip().lower()]
+    return peer_id_from(p.email or p.name)
+
+
+def ensure_peer(honcho: Any, peer_id: str, participant: Participant | None,
+                is_external: bool, stamped: set[str]) -> Any:
+    """Get/create a peer, stamp its identity metadata, apply the externals tier.
+
+    Metadata stamping records every email/name/source observed for the peer so
+    other importers (Gmail, etc.) can resolve identities against the same registry.
+    """
+    peer = honcho.peer(peer_id)
+    if peer_id in stamped:
+        return peer
+    stamped.add(peer_id)
+    try:
+        meta = peer.get_metadata() or {}
+        changed = False
+        for key, value in (("emails", participant.email if participant else None),
+                           ("names", participant.name if participant else None),
+                           ("sources", "granola")):
+            if not value:
+                continue
+            existing = meta.get(key) or []
+            if value not in existing:
+                meta[key] = existing + [value]
+                changed = True
+        if changed:
+            peer.set_metadata(meta)
+        if is_external and EXTERNALS_TIER == "store":
+            from honcho.peer import PeerConfig
+            peer.set_configuration(PeerConfig(observe_me=False))
+    except Exception as e:
+        print(f"  (peer metadata/config for {peer_id} failed: {e})")
+    return peer
+
+
 def sanitize(text: str) -> str:
     """Remove null bytes and control characters."""
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -1030,6 +1110,45 @@ def import_two_person(
     print(f"  -> Imported as 2-person ({me_peer_id} + {them_peer_id})")
 
 
+def import_multi(
+    honcho: Any,
+    session: Any,
+    me_peer_id: str,
+    others: list[Participant],
+    turns: list[TranscriptTurn],
+    meeting: dict[str, Any],
+    metadata: dict[str, object],
+    created_at: datetime,
+    stamped: set[str],
+) -> None:
+    """Import a multi-person meeting: the user's own (microphone-grounded) turns
+    plus the meeting summary. External attendees join the session as members so
+    the deriver can observe their presence at summary fidelity — their collapsed
+    'Them' speech is never attributed to individuals."""
+    me_peer = honcho.peer(me_peer_id)
+
+    summary = extract_summary(meeting) or "No summary available"
+    title = meeting.get("title", "Untitled")
+    header = (f"Meeting: {title}\nDate: {meeting.get('date', '')}\n"
+              f"Participants: {meeting.get('participants', '')}\n\n")
+    messages = build_messages(me_peer, header + summary, metadata, created_at)
+
+    my_turns = [t for t in turns if t.speaker == "Me"]
+    for t in my_turns:
+        messages.extend(build_messages(me_peer, t.text, None, created_at))
+
+    if others and EXTERNALS_TIER != "none":
+        try:
+            members = [ensure_peer(honcho, resolve_peer_id(p), p, True, stamped) for p in others]
+            session.add_peers(members)
+        except Exception as e:
+            print(f"  (adding session members failed: {e})")
+
+    send_messages(session, messages)
+    print(f"  -> Imported as multi ({len(my_turns)} of my turns + summary"
+          f"{f', {len(others)} members' if others and EXTERNALS_TIER != 'none' else ''})")
+
+
 def import_summary(
     honcho: Any,
     session: Any,
@@ -1099,7 +1218,13 @@ def review_meeting(
     them_turns = len(turns) - me_turns
     total_words = sum(len(t.text.split()) for t in turns)
 
-    two_person_default = len(others) == 1 and them_turns > 0
+    has_transcript = bool(meeting.get("transcript"))
+    two_person_ok = EXTERNALS_TIER != "none" and len(others) == 1 and them_turns > 0
+    # Room-mic suspect: attendees on the invite but only "Me" audio — likely an
+    # in-person meeting where the laptop mic captured everyone, so "Me" turns
+    # may contain other people's words. Don't auto-ingest those to the user peer.
+    room_mic = len(others) >= 1 and me_turns > 0 and them_turns == 0 and has_transcript
+    adhoc = them_turns > 0 and not others  # someone spoke, but no attendees listed
 
     # Pending transcript: don't lock in a summary import
     if t_status in ("rate_limited", "error"):
@@ -1116,7 +1241,13 @@ def review_meeting(
         return ("summary", None) if choice == "s" else ("skip", None)
 
     if AUTO_MODE:
-        return ("two_person", others[0]) if two_person_default else ("summary", None)
+        if two_person_ok:
+            return ("two_person", others[0])
+        if room_mic:
+            return ("summary", None)
+        if me_turns > 0:
+            return ("multi", None)
+        return ("summary", None)
 
     print(f"\n{'─' * 60}")
     print(f"  [{index}/{total}] {title}")
@@ -1128,11 +1259,8 @@ def review_meeting(
         org_str = f" ({p.org})" if p.org else ""
         print(f"    {j}. {p.name}{email_str}{org_str}")
 
-    has_transcript = bool(meeting.get("transcript"))
     if turns:
         print(f"  Transcript: {me_turns} Me, {them_turns} Them, ~{total_words} words")
-        if them_turns == 0:
-            print("  ** No 'Them' turns — nobody else spoke **")
         if total_words < 30:
             print("  ** Very short — might be empty **")
     elif has_transcript:
@@ -1142,13 +1270,27 @@ def review_meeting(
     else:
         print(f"  Content: {'summary available' if extract_summary(meeting) else 'metadata only'}")
 
+    # Flag: room-mic suspect — safe default is summary only
+    if room_mic:
+        print("\n  ⚑ Attendees listed but zero 'Them' turns — likely in-person/room-mic,")
+        print("    so 'Me' may contain other people's voices. Suggested: summary only.")
+        choice = ask("  [Enter] summary only (safe) / [m] also ingest my turns / [k] skip / [a] auto-rest: ").strip().lower()
+        while choice not in ("", "m", "k", "a"):
+            choice = ask("  [Enter] summary only / [m] ingest my turns / [k] skip / [a] auto-rest: ").strip().lower()
+        if choice == "a":
+            AUTO_MODE = True
+            choice = ""
+        if choice == "k":
+            return ("skip", None)
+        return ("multi", None) if choice == "m" else ("summary", None)
+
     # Two-person default: exactly one other participant with transcript
-    if two_person_default:
+    if two_person_ok:
         them_label = others[0].name + (f" <{others[0].email}>" if others[0].email else "")
         print(f"\n  Detected: 2-person call (you + {them_label})")
-        choice = ask("  [Enter] 2-person / [s]ummary / [k] skip / [a] auto-rest: ").strip().lower()
-        while choice not in ("", "s", "k", "a"):
-            choice = ask("  [Enter] 2-person / [s]ummary / [k] skip / [a] auto-rest: ").strip().lower()
+        choice = ask("  [Enter] 2-person / [m]ulti (my turns + summary) / [s]ummary / [k] skip / [a] auto-rest: ").strip().lower()
+        while choice not in ("", "m", "s", "k", "a"):
+            choice = ask("  [Enter] 2-person / [m]ulti / [s]ummary / [k] skip / [a] auto-rest: ").strip().lower()
         if choice == "a":
             AUTO_MODE = True
             choice = ""
@@ -1156,14 +1298,27 @@ def review_meeting(
             return ("skip", None)
         if choice == "s":
             return ("summary", None)
+        if choice == "m":
+            return ("multi", None)
         return ("two_person", others[0])
 
-    # Multi-person with transcript
-    if len(others) > 1 and them_turns > 0:
-        print(f"\n  {len(others)} participants")
-        choice = ask("  [Enter] summary / [2] 2-person / [k] skip / [a] auto-rest: ").strip().lower()
-        while choice not in ("", "2", "k", "a"):
-            choice = ask("  [Enter] summary / [2] 2-person / [k] skip / [a] auto-rest: ").strip().lower()
+    # Multi-person (or ad-hoc) with the user speaking: default = my turns + summary
+    if me_turns > 0:
+        if adhoc:
+            print("\n  ⚑ Ad-hoc meeting: someone spoke but no attendees are listed, so")
+            print("    'Them' can't be attributed. Suggested: import my turns + summary.")
+        else:
+            print(f"\n  {len(others)} participants — 'Them' is collapsed, can't attribute individuals.")
+            print("    Suggested: my turns + summary (attendees join the session as members).")
+        opts = "  [Enter] multi (my turns + summary)"
+        valid = ("", "s", "k", "a")
+        if others and EXTERNALS_TIER != "none":
+            opts += " / [2] treat as 2-person"
+            valid = ("", "2", "s", "k", "a")
+        opts += " / [s]ummary only / [k] skip / [a] auto-rest: "
+        choice = ask(opts).strip().lower()
+        while choice not in valid:
+            choice = ask(opts).strip().lower()
         if choice == "a":
             AUTO_MODE = True
             choice = ""
@@ -1174,9 +1329,11 @@ def review_meeting(
             if them is None:
                 return ("summary", None)
             return ("two_person", them)
-        return ("summary", None)
+        if choice == "s":
+            return ("summary", None)
+        return ("multi", None)
 
-    # No transcript or no other speakers
+    # No transcript or the user never spoke
     choice = ask("  [Enter] summary / [k] skip / [a] auto-rest: ").strip().lower()
     while choice not in ("", "k", "a"):
         choice = ask("  [Enter] summary / [k] skip / [a] auto-rest: ").strip().lower()
@@ -1279,7 +1436,7 @@ async def main():
                     choice = ask("  [Enter] replace with fresh imports / [s] leave untouched: ").strip().lower()
                     replace_orphans = choice != "s"
 
-            seen_peers: set[str] = set()
+            stamped: set[str] = set()
             results = {"imported": 0, "skipped": 0, "failed": 0, "already": 0, "pending": 0}
 
             print("\n" + "=" * 60)
@@ -1293,20 +1450,25 @@ async def main():
                 sid = f"meeting-{mid}"
                 t_status = m.get("transcript_status", "none")
 
+                participants = parse_participants(m.get("participants", ""))
+                turns = parse_transcript_turns(m["transcript"]) if m.get("transcript") else []
+                me_speaks = any(t.speaker == "Me" for t in turns)
+
                 prior = imported.get(mid)
                 if prior:
-                    # Already imported by v2. Only revisit summary imports that can now be upgraded.
-                    upgradable = prior.get("mode") == "summary" and prior.get("transcript_status") != "ok" \
-                        and t_status == "ok"
+                    # Revisit only imports that can now be upgraded: summaries whose
+                    # transcript has since arrived, or pre-v3 summaries that can now
+                    # carry the user's own turns (multi mode).
+                    upgradable = t_status == "ok" and prior.get("mode") == "summary" and (
+                        prior.get("transcript_status") != "ok"
+                        or (me_speaks and not prior.get("v3"))
+                    )
                     if not upgradable:
                         results["already"] += 1
                         continue
                 elif sid in existing_sessions and not replace_orphans:
                     results["already"] += 1
                     continue
-
-                participants = parse_participants(m.get("participants", ""))
-                turns = parse_transcript_turns(m["transcript"]) if m.get("transcript") else []
 
                 mode, them = review_meeting(i, len(records), m, participants, turns)
 
@@ -1320,21 +1482,19 @@ async def main():
 
                 creator = participants.note_creator
                 me_source = (creator.email or creator.name) if creator else None
-                if not me_source:
+                if not me_source and not ME_PEER_OVERRIDE:
                     print("  -> Skipped (no creator identifier)")
                     results["skipped"] += 1
                     continue
 
-                me_peer_id = ME_PEER_OVERRIDE or peer_id_from(me_source)
-                if me_peer_id not in seen_peers:
-                    print(f"  New peer: {me_source} ({me_peer_id})")
-                    seen_peers.add(me_peer_id)
+                me_peer_id = ME_PEER_OVERRIDE or resolve_peer_id(creator)
 
                 try:
                     created_at = parse_date(m.get("date", ""))
                     if prior or (sid in existing_sessions and replace_orphans):
                         delete_session(sid)
                         print(f"  (replaced earlier import of {sid})")
+                    ensure_peer(honcho, me_peer_id, creator, False, stamped)
                     session = honcho.session(sid)
                     metadata: dict[str, object] = {
                         "title": m.get("title", "Untitled"),
@@ -1344,12 +1504,12 @@ async def main():
                     }
 
                     if mode == "two_person" and them is not None:
-                        them_source = them.email or them.name
-                        them_peer_id = peer_id_from(them_source)
-                        if them_peer_id not in seen_peers:
-                            print(f"  New peer: {them_source} ({them_peer_id})")
-                            seen_peers.add(them_peer_id)
+                        them_peer_id = resolve_peer_id(them)
+                        ensure_peer(honcho, them_peer_id, them, True, stamped)
                         import_two_person(honcho, session, me_peer_id, them_peer_id, turns, metadata, created_at)
+                    elif mode == "multi":
+                        import_multi(honcho, session, me_peer_id, participants.others, turns,
+                                     m, metadata, created_at, stamped)
                     else:
                         import_summary(honcho, session, me_peer_id, m, metadata, created_at)
 
@@ -1358,6 +1518,7 @@ async def main():
                         "mode": mode,
                         "session": sid,
                         "transcript_status": t_status,
+                        "v3": True,
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
                     save_json(IMPORTED_FILE, imported)
@@ -1378,9 +1539,9 @@ async def main():
             print(f"  Skipped:           {results['skipped']}")
             print(f"  Pending transcript:{results['pending']}  (re-run to retry these)")
             print(f"  Failed:            {results['failed']}")
-            print(f"  Workspace: {HONCHO_WORKSPACE}")
-            if seen_peers:
-                print(f"  Peers this run: {sorted(seen_peers)}")
+            print(f"  Workspace: {HONCHO_WORKSPACE}  (externals tier: {EXTERNALS_TIER})")
+            if stamped:
+                print(f"  Peers this run: {sorted(stamped)}")
 
         except KeyboardInterrupt:
             print("\n\nAborted. All fetched data and import state are saved — just re-run to resume.")
