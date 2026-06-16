@@ -113,6 +113,7 @@ HONCHO_WORKSPACE = os.environ.get("GRANOLA_WORKSPACE", "granola")
 ME_PEER_OVERRIDE = os.environ.get("GRANOLA_ME_PEER")  # map the note creator to an existing peer ID
 EXTERNALS_TIER = os.environ.get("GRANOLA_EXTERNALS", "full")  # full | store | none
 HONCHO_BASE_URL = os.environ.get("HONCHO_BASE_URL", "https://api.honcho.dev")
+OWNER_EMAIL: str | None = None  # the logged-in Granola account; set from get_account_info
 MAX_MESSAGE_LEN = 24000  # Honcho message size limit (25000 max, leave headroom)
 
 # Local state
@@ -424,6 +425,16 @@ class McpClient:
     async def list_tools(self) -> list[dict[str, Any]]:
         result = await self.call("tools/list", {})
         return result.get("tools", [])
+
+    async def account_email(self) -> str | None:
+        """The email of the logged-in Granola account (the true 'me')."""
+        try:
+            text = await self.call_tool_text("get_account_info", {})
+            m = re.search(r'"email"\s*:\s*"([^"]+)"', text)
+            return m.group(1) if m else None
+        except Exception as e:
+            print(f"  (could not determine account owner: {e})")
+            return None
 
 
 class _HttpRateLimited(Exception):
@@ -848,6 +859,18 @@ async def fetch_all(mcp: McpClient, meetings: list[dict[str, Any]]) -> list[dict
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
+def is_calendar_resource(email: str | None, name: str | None) -> bool:
+    """Calendar rooms/resources/shared calendars are not people.
+
+    Google exposes meeting rooms as `c_...@resource.calendar.google.com` and
+    shared calendars as `...@group.calendar.google.com`; they show up in
+    Granola's participant list but must never become peers.
+    """
+    if email and re.search(r"\.calendar\.google\.com$", email, re.IGNORECASE):
+        return True
+    return False
+
+
 def parse_participants(participants_str: str) -> ParsedParticipants:
     """Parse Granola's participant string into structured participants."""
     result = ParsedParticipants()
@@ -884,6 +907,9 @@ def parse_participants(participants_str: str) -> ParsedParticipants:
         if not name:
             print(f"  Warning: could not parse participant entry: {entry!r}")
             continue
+
+        if is_calendar_resource(email, name):
+            continue  # meeting room / shared calendar, not a person
 
         org = None
         org_match = re.match(r"(.+?)\s+from\s+(.+)", name)
@@ -970,6 +996,34 @@ def resolve_peer_id(p: Participant) -> str:
         if ident and ident.strip().lower() in ALIASES:
             return ALIASES[ident.strip().lower()]
     return peer_id_from(p.email or p.name)
+
+
+def owner_canonical_id() -> str | None:
+    """Canonical peer ID for the logged-in account (honoring aliases/override)."""
+    if ME_PEER_OVERRIDE:
+        return ME_PEER_OVERRIDE
+    if OWNER_EMAIL:
+        return resolve_peer_id(Participant(name=OWNER_EMAIL, email=OWNER_EMAIL))
+    return None
+
+
+def creator_is_owner(creator: Participant | None) -> bool:
+    """Is the note creator the logged-in account owner?
+
+    Granola notes can be created by a teammate and shared into your account; in
+    those the "Me" track is the teammate's microphone, not yours. We only treat a
+    meeting as the user's own recording when the creator matches the account owner
+    (by email or alias). If the owner is unknown (e.g. offline replay), assume yes
+    so single-user imports behave as before.
+    """
+    if not OWNER_EMAIL:
+        return True
+    if not creator:
+        return False
+    if (creator.email or "").strip().lower() == OWNER_EMAIL.strip().lower():
+        return True
+    oc = owner_canonical_id()
+    return oc is not None and resolve_peer_id(creator) == oc
 
 
 def ensure_peer(honcho: Any, peer_id: str, participant: Participant | None,
@@ -1226,6 +1280,23 @@ def review_meeting(
     room_mic = len(others) >= 1 and me_turns > 0 and them_turns == 0 and has_transcript
     adhoc = them_turns > 0 and not others  # someone spoke, but no attendees listed
 
+    # Foreign note: a teammate created/shared this note, so the "Me" track is
+    # THEIR microphone, not yours. Never attribute it to the user's peer.
+    if not creator_is_owner(creator):
+        who = (creator.email or creator.name) if creator else "someone else"
+        if AUTO_MODE:
+            return ("skip", None)
+        print(f"\n{'─' * 60}")
+        print(f"  [{index}/{total}] {title}")
+        print(f"  Date: {date}")
+        print(f"  ⚑ Created by {who}, not you ({OWNER_EMAIL}). The 'Me' track is")
+        print("    their microphone — importing it as yours would corrupt your peer.")
+        choice = ask("  [Enter] skip (not your recording) / [s] import summary as your note / [a] auto-rest: ").strip().lower()
+        if choice == "a":
+            AUTO_MODE = True
+            return ("skip", None)
+        return ("summary", None) if choice == "s" else ("skip", None)
+
     # Pending transcript: don't lock in a summary import
     if t_status in ("rate_limited", "error"):
         if AUTO_MODE:
@@ -1408,6 +1479,12 @@ async def main():
             tools = await mcp.list_tools()
             save_json(DIAG_DIR / "tools.json", tools)
 
+            global OWNER_EMAIL
+            OWNER_EMAIL = await mcp.account_email()
+            if OWNER_EMAIL:
+                print(f"  Account owner: {OWNER_EMAIL} "
+                      f"(only meetings you recorded import as you)")
+
             print("\nListing meetings from Granola...")
             meetings = await list_all_meetings(mcp, tools)
             if not meetings:
@@ -1481,27 +1558,40 @@ async def main():
                     continue
 
                 creator = participants.note_creator
-                me_source = (creator.email or creator.name) if creator else None
-                if not me_source and not ME_PEER_OVERRIDE:
+                # The "me" peer is always the account owner — never a teammate
+                # who created a shared note (review already skipped foreign notes
+                # unless the user chose summary, where the note is still THEIRS).
+                if creator_is_owner(creator) and creator:
+                    me_participant = creator
+                elif OWNER_EMAIL:
+                    me_participant = Participant(name=None, email=OWNER_EMAIL)
+                else:
+                    me_participant = creator
+                me_peer_id = ME_PEER_OVERRIDE or (
+                    resolve_peer_id(me_participant) if me_participant else None)
+                if not me_peer_id:
                     print("  -> Skipped (no creator identifier)")
                     results["skipped"] += 1
                     continue
-
-                me_peer_id = ME_PEER_OVERRIDE or resolve_peer_id(creator)
 
                 try:
                     created_at = parse_date(m.get("date", ""))
                     if prior or (sid in existing_sessions and replace_orphans):
                         delete_session(sid)
                         print(f"  (replaced earlier import of {sid})")
-                    ensure_peer(honcho, me_peer_id, creator, False, stamped)
+                    ensure_peer(honcho, me_peer_id, me_participant, False, stamped)
                     session = honcho.session(sid)
                     metadata: dict[str, object] = {
                         "title": m.get("title", "Untitled"),
                         "date": m.get("date", ""),
                         "granola_meeting_id": mid,
                         "mode": mode,
+                        "source": "granola",
                     }
+                    try:
+                        session.set_metadata(metadata)
+                    except Exception as e:
+                        print(f"  (session metadata failed: {e})")
 
                     if mode == "two_person" and them is not None:
                         them_peer_id = resolve_peer_id(them)
